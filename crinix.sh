@@ -1,7 +1,7 @@
 #!/bin/bash
-# HrNodes Advanced MOTD Installer
+# CrinixCloud Advanced MOTD Installer
 
-echo "🔧 Installing HrNodes Custom MOTD..."
+echo "🔧 Installing CrinixCloud Custom MOTD..."
 
 # Disable default MOTD spam (safe)
 for f in /etc/update-motd.d/*; do
@@ -66,7 +66,7 @@ LOGO
 echo -e "${RESET}"
 
 # ===== Welcome =====
-echo -e "${GREEN}Welcome to HrNodes Datacenter 🚀${RESET}"
+echo -e "${GREEN}Welcome to CrinixCloud Datacenter 🚀${RESET}"
 echo -e "${BLUE}High Performance • Reliable • Secure${RESET}\n"
 
 # ===== Stats =====
@@ -83,12 +83,13 @@ printf "  ${YELLOW}IP Address   :${RESET} %s\n" "$IP"
 printf "  ${YELLOW}Uptime       :${RESET} %s\n\n" "$UPTIME"
 
 # ===== Footer =====
-echo -e "${GREEN}Support:${RESET} support@hrnodes.xyz"
-echo -e "${GREEN}Website:${RESET} https://hrnodes.xyz"
+echo -e "${GREEN}Support:${RESET} support@crinixcloud.site"
+echo -e "${GREEN}Discord:${RESET} https://discord.gg/7CtNC27PwS"
+echo -e "${GREEN}Website:${RESET} https://crinixcloud.site"
 echo -e "${CYAN}Quality Wise — No Compromise 😄${RESET}"
 EOF
 
 chmod +x /etc/update-motd.d/00-hrnodes
 
-echo "🎉 HrNodes MOTD Installed Successfully!"
+echo "🎉 CrinixCloud MOTD Installed Successfully!"
 echo "➡ Reconnect SSH to see the new MOTD."
