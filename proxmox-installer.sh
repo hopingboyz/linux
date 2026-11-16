@@ -195,18 +195,23 @@ done
 success "Configuration backup created: $BACKUP_DIR"
 
 # 6. Configure hostname and hosts mapping without changing network settings
-hostnamectl set-hostname "$FQDN"
+# Debian/Proxmox use the short node hostname; /etc/hosts maps both names to
+# the management IP. Check the "files" NSS source directly so an unrelated
+# public DNS record cannot cause a false failure.
+hostnamectl set-hostname "$SHORT_HOSTNAME"
 
 python3 - "$IP_ADDRESS" "$FQDN" "$SHORT_HOSTNAME" <<'PY'
 from pathlib import Path
+import ipaddress
 import sys
 
 ip, fqdn, short = sys.argv[1:]
+ipaddress.IPv4Address(ip)
 path = Path("/etc/hosts")
 lines = path.read_text().splitlines() if path.exists() else []
 out = []
-localhost4 = False
-localhost6 = False
+seen_v4 = False
+seen_v6 = False
 
 for line in lines:
     stripped = line.strip()
@@ -214,43 +219,59 @@ for line in lines:
         out.append(line)
         continue
 
-    parts = stripped.split()
-    if len(parts) < 2:
+    fields = stripped.split()
+    if len(fields) < 2:
         out.append(line)
         continue
 
-    addr, *names = parts
-    if addr == "127.0.0.1":
-        names = [n for n in names if n not in (fqdn, short)]
-        if "localhost" in names:
-            localhost4 = True
-        out.append("\t".join([addr] + names) if names else "127.0.0.1 localhost")
-    elif addr == "::1":
-        localhost6 = "localhost" in names
-        names = [n for n in names if n not in (fqdn, short)]
-        out.append("\t".join([addr] + names) if names else "::1 localhost")
-    else:
-        names = [n for n in names if n not in (fqdn, short)]
-        if names:
-            out.append("\t".join([addr] + names))
+    address, *names = fields
+    # Remove only aliases belonging to this node. Preserve unrelated hosts.
+    names = [name for name in names if name not in (fqdn, short)]
 
-if not localhost4:
+    if address == "127.0.0.1":
+        if "localhost" in names:
+            seen_v4 = True
+        if not names:
+            names = ["localhost"]
+        out.append("\\t".join([address, *names]))
+    elif address == "::1":
+        if "localhost" in names:
+            seen_v6 = True
+        if not names:
+            names = ["localhost"]
+        out.append("\\t".join([address, *names]))
+    elif names:
+        out.append("\\t".join([address, *names]))
+
+if not seen_v4:
     out.insert(0, "127.0.0.1 localhost")
-if not localhost6:
+if not seen_v6:
     out.append("::1 localhost")
 
-# Ensure the node's FQDN resolves directly to its management address.
-out.append(f"{ip}\t{fqdn} {short}")
-path.write_text("\n".join(out) + "\n")
+# Put the node mapping at the end; both names resolve to the selected IP.
+out.append(f"{ip}\\t{fqdn} {short}")
+path.write_text("\\n".join(out) + "\\n")
 PY
 
-hostname "$FQDN"
-getent hosts "$FQDN" | awk '{print $1}' | grep -Fxq "$IP_ADDRESS" ||
-    die "FQDN does not resolve to the selected management IP after /etc/hosts update."
-getent hosts "$SHORT_HOSTNAME" | awk '{print $1}' | grep -Fxq "$IP_ADDRESS" ||
-    die "Short hostname does not resolve to the selected management IP."
-success "Hostname and /etc/hosts verified."
+# Keep the system hostname short, as expected by common Proxmox node setups.
+hostname "$SHORT_HOSTNAME"
 
+HOSTS_LOOKUP="$(getent -s files hosts "$FQDN" 2>/dev/null || true)"
+if ! awk -v ip="$IP_ADDRESS" '$1 == ip { found=1 } END { exit !found }' <<<"$HOSTS_LOOKUP"; then
+    error "The /etc/hosts entry was written, but the local hosts database did not return the expected address."
+    error "Expected: ${IP_ADDRESS} ${FQDN} ${SHORT_HOSTNAME}"
+    error "Current matching entry:"
+    grep -E "[[:space:]]${FQDN//./\\.}([[:space:]]|$)" /etc/hosts || true
+    die "Hostname mapping verification failed. No packages have been installed yet."
+fi
+
+SHORT_LOOKUP="$(getent -s files hosts "$SHORT_HOSTNAME" 2>/dev/null || true)"
+if ! awk -v ip="$IP_ADDRESS" '$1 == ip { found=1 } END { exit !found }' <<<"$SHORT_LOOKUP"; then
+    die "Short hostname does not resolve through /etc/hosts to ${IP_ADDRESS}."
+fi
+
+[[ "$(hostname -s)" == "$SHORT_HOSTNAME" ]] || die "System short hostname did not apply correctly."
+success "Hostname and /etc/hosts verified: ${FQDN} -> ${IP_ADDRESS}"
 # 7. Disable only conflicting Proxmox repository entries; preserve unrelated sources.
 info "Checking for old/enterprise Proxmox repository entries..."
 python3 <<'PY'
