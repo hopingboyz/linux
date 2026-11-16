@@ -208,7 +208,11 @@ import sys
 ip, fqdn, short = sys.argv[1:]
 ipaddress.IPv4Address(ip)
 path = Path("/etc/hosts")
-lines = path.read_text().splitlines() if path.exists() else []
+# Recover hosts files previously written with literal "\\n"/"\\t" text
+# by an earlier buggy installer build.
+raw_text = path.read_text() if path.exists() else ""
+raw_text = raw_text.replace(r"\\n", "\\n").replace(r"\\t", "\\t")
+lines = raw_text.splitlines()
 out = []
 seen_v4 = False
 seen_v6 = False
@@ -233,15 +237,15 @@ for line in lines:
             seen_v4 = True
         if not names:
             names = ["localhost"]
-        out.append("\\t".join([address, *names]))
+        out.append("\t".join([address, *names]))
     elif address == "::1":
         if "localhost" in names:
             seen_v6 = True
         if not names:
             names = ["localhost"]
-        out.append("\\t".join([address, *names]))
+        out.append("\t".join([address, *names]))
     elif names:
-        out.append("\\t".join([address, *names]))
+        out.append("\t".join([address, *names]))
 
 if not seen_v4:
     out.insert(0, "127.0.0.1 localhost")
@@ -249,25 +253,52 @@ if not seen_v6:
     out.append("::1 localhost")
 
 # Put the node mapping at the end; both names resolve to the selected IP.
-out.append(f"{ip}\\t{fqdn} {short}")
-path.write_text("\\n".join(out) + "\\n")
+out.append(f"{ip}\t{fqdn} {short}")
+path.write_text("\n".join(out) + "\n")
 PY
 
 # Keep the system hostname short, as expected by common Proxmox node setups.
 hostname "$SHORT_HOSTNAME"
 
-HOSTS_LOOKUP="$(getent -s files hosts "$FQDN" 2>/dev/null || true)"
+# Verify the literal hosts-file record first, then ask libc to resolve it.
+# This avoids depending on getent's optional -s service-selection syntax.
+python3 - "$IP_ADDRESS" "$FQDN" "$SHORT_HOSTNAME" <<'PY'
+from pathlib import Path
+import ipaddress
+import sys
+
+ip, fqdn, short = sys.argv[1:]
+matches = []
+for raw in Path("/etc/hosts").read_text().splitlines():
+    line = raw.split("#", 1)[0].strip()
+    if not line:
+        continue
+    fields = line.split()
+    try:
+        address = str(ipaddress.ip_address(fields[0]))
+    except (ValueError, IndexError):
+        continue
+    aliases = fields[1:]
+    if fqdn in aliases and short in aliases and address == ip:
+        matches.append(raw)
+
+if not matches:
+    raise SystemExit(
+        f"Missing /etc/hosts mapping: {ip} {fqdn} {short}. "
+        "Inspect /etc/hosts and check for a read-only or managed hosts file."
+    )
+PY
+
+HOSTS_LOOKUP="$(getent hosts "$FQDN" 2>/dev/null || true)"
 if ! awk -v ip="$IP_ADDRESS" '$1 == ip { found=1 } END { exit !found }' <<<"$HOSTS_LOOKUP"; then
-    error "The /etc/hosts entry was written, but the local hosts database did not return the expected address."
-    error "Expected: ${IP_ADDRESS} ${FQDN} ${SHORT_HOSTNAME}"
-    error "Current matching entry:"
-    grep -E "[[:space:]]${FQDN//./\\.}([[:space:]]|$)" /etc/hosts || true
-    die "Hostname mapping verification failed. No packages have been installed yet."
+    warn "The hosts-file entry is correct, but NSS resolution did not return ${IP_ADDRESS}."
+    warn "Check /etc/nsswitch.conf (hosts: files should appear before dns) and any local name-service overrides."
+    die "Hostname resolution verification failed."
 fi
 
-SHORT_LOOKUP="$(getent -s files hosts "$SHORT_HOSTNAME" 2>/dev/null || true)"
+SHORT_LOOKUP="$(getent hosts "$SHORT_HOSTNAME" 2>/dev/null || true)"
 if ! awk -v ip="$IP_ADDRESS" '$1 == ip { found=1 } END { exit !found }' <<<"$SHORT_LOOKUP"; then
-    die "Short hostname does not resolve through /etc/hosts to ${IP_ADDRESS}."
+    die "Short hostname does not resolve to ${IP_ADDRESS}."
 fi
 
 [[ "$(hostname -s)" == "$SHORT_HOSTNAME" ]] || die "System short hostname did not apply correctly."
