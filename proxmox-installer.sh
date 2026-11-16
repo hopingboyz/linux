@@ -270,7 +270,7 @@ if path.exists():
     output = []
     found = False
     for line in lines:
-        match = re.match(r"^(\\s*hosts\\s*:\\s*)(.*)$", line)
+        match = re.match(r"^(\s*hosts\s*:\s*)(.*)$", line)
         if match and not line.lstrip().startswith("#"):
             tokens = [x for x in match.group(2).split() if x != "files"]
             tokens.insert(0, "files")
@@ -280,7 +280,7 @@ if path.exists():
             output.append(line)
     if not found:
         output.append("hosts: files dns")
-    path.write_text("\\n".join(output) + "\\n")
+    path.write_text("\n".join(output) + "\n")
 PY
 
 # Verify the literal hosts-file record and resolve IPv4 specifically.
