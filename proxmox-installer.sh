@@ -1,330 +1,324 @@
-
 #!/usr/bin/env bash
 #
-# Atyro Proxmox VE Installer
-# Version: 3.0.0
-# Debian 12 = Proxmox VE 8
-# Debian 13 = Proxmox VE 9
+# Proxmox Installer
+# Author: Atyro Labs
+# Version: 1.0
+# Debian 12 (Bookworm) -> Proxmox VE 8
+# Debian 13 (Trixie)   -> Proxmox VE 9
+#
+# Installs Proxmox VE on an existing Debian host using official repositories.
+# The official Proxmox ISO installer remains the recommended method for new hosts.
 #
 
 set -Eeuo pipefail
-export DEBIAN_FRONTEND=noninteractive
+IFS=$'\n\t'
 umask 022
 
-VERSION="3.0.0"
-LOG_FILE="/var/log/atyro-proxmox-installer.log"
+NAME="Proxmox Installer"
+VERSION="1.0"
+AUTHOR="Atyro Labs"
+LOG_FILE="/var/log/proxmox-installer.log"
+BACKUP_DIR=""
+REPO_FILE="/etc/apt/sources.list.d/atyro-proxmox.sources"
 KEYRING="/usr/share/keyrings/proxmox-archive-keyring.gpg"
-REPO_FILE="/etc/apt/sources.list.d/pve-install.sources"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-RESET='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; RESET='\033[0m'
 
 mkdir -p /var/log
 touch "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-info()    { echo -e "${CYAN}[INFO]${RESET} $*"; }
-success() { echo -e "${GREEN}[SUCCESS]${RESET} $*"; }
-warn()    { echo -e "${YELLOW}[WARNING]${RESET} $*"; }
-error()   { echo -e "${RED}[ERROR]${RESET} $*" >&2; }
+info()    { printf "${CYAN}[INFO]${RESET} %s\n" "$*"; }
+success() { printf "${GREEN}[SUCCESS]${RESET} %s\n" "$*"; }
+warn()    { printf "${YELLOW}[WARNING]${RESET} %s\n" "$*"; }
+error()   { printf "${RED}[ERROR]${RESET} %s\n" "$*" >&2; }
 die()     { error "$*"; exit 1; }
 
-trap 'rc=$?; error "Failed at line ${LINENO} (exit ${rc}). Log: ${LOG_FILE}"; exit "$rc"' ERR
+on_error() {
+    local rc=$?
+    error "Unexpected failure at line ${BASH_LINENO[0]:-unknown} (exit ${rc})."
+    error "Review the log: ${LOG_FILE}"
+    exit "$rc"
+}
+trap on_error ERR
 
-echo
-echo "============================================"
-echo "       ATYRO PROXMOX VE INSTALLER"
-echo "              Version $VERSION"
-echo "============================================"
-echo
+banner() {
+    printf '\n'
+    printf '%s\n' '============================================================'
+    printf '  %s | v%s\n' "$NAME" "$VERSION"
+    printf '  Author: %s\n' "$AUTHOR"
+    printf '%s\n' '============================================================'
+    printf '\n'
+}
 
-# --------------------------------------------------
-# 1. Root and OS checks
-# --------------------------------------------------
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || die "Required command not found: $1"
+}
 
-[[ "$EUID" -eq 0 ]] || die "Run this installer as root."
-[[ -f /etc/os-release ]] || die "OS detection failed."
-command -v systemctl >/dev/null || die "systemd required."
-command -v apt-get >/dev/null || die "APT is required."
-command -v python3 >/dev/null || die "Python3 is required."
-command -v ip >/dev/null || die "iproute2 is required."
+ask_yes_no() {
+    local prompt="$1" answer
+    [[ -t 0 ]] || die "Interactive terminal required for confirmation: ${prompt}"
+    read -r -p "$prompt [y/N]: " answer
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+valid_fqdn() {
+    python3 - "$1" <<'PY'
+import re, sys
+name = sys.argv[1].rstrip(".")
+if len(name) > 253 or "." not in name:
+    raise SystemExit(1)
+labels = name.split(".")
+if any(not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", x) for x in labels):
+    raise SystemExit(1)
+PY
+}
+
+banner
+
+# 1. Host and operating-system checks
+[[ "$EUID" -eq 0 ]] || die "Run as root: sudo bash proxmox-installer.sh"
+[[ -r /etc/os-release ]] || die "Cannot identify the operating system."
+require_command apt-get
+require_command dpkg
+require_command dpkg-query
+require_command systemctl
+require_command ip
+require_command awk
+require_command grep
+require_command sed
+require_command python3
+require_command getent
 
 source /etc/os-release
+[[ "${ID:-}" == "debian" ]] || die "Only Debian 12 and Debian 13 are supported."
 
-[[ "$ID" == "debian" ]] || die "Only Debian is supported."
-
-case "$VERSION_ID" in
+case "${VERSION_ID:-}" in
     12)
         CODENAME="bookworm"
-        PVE_VERSION="8"
+        PVE_MAJOR="8"
         KEY_URL="https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg"
         ;;
     13)
         CODENAME="trixie"
-        PVE_VERSION="9"
+        PVE_MAJOR="9"
         KEY_URL="https://enterprise.proxmox.com/debian/proxmox-archive-keyring-trixie.gpg"
         ;;
     *)
-        die "Unsupported Debian version: $VERSION_ID"
+        die "Unsupported Debian version: ${VERSION_ID:-unknown}. Supported: Debian 12 and 13."
         ;;
 esac
 
 ARCH="$(dpkg --print-architecture)"
-[[ "$ARCH" == "amd64" ]] || die "Only amd64 is supported."
+[[ "$ARCH" == "amd64" ]] || die "This installer currently supports amd64 only (detected: $ARCH)."
 
-info "Detected Debian $VERSION_ID ($CODENAME)"
-info "Target Proxmox VE version: $PVE_VERSION"
+if systemd-detect-virt --container >/dev/null 2>&1; then
+    die "Container environment detected. Install Proxmox VE on a supported physical host or a properly configured virtualization host, not inside an ordinary container."
+fi
 
-# --------------------------------------------------
-# 2. Existing Proxmox installation protection
-# --------------------------------------------------
+[[ -d /run/systemd/system ]] || die "A running systemd environment is required."
+info "Detected: Debian ${VERSION_ID} (${CODENAME}), architecture ${ARCH}"
+info "Target: Proxmox VE ${PVE_MAJOR}"
 
+# 2. Protect existing Proxmox/cluster installations
 for pkg in proxmox-ve pve-manager corosync; do
-    if dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null |
-        grep -q "install ok installed"; then
-        die "Existing Proxmox package detected: $pkg. Installer will not overwrite it."
+    if dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then
+        die "Existing Proxmox-related package detected: ${pkg}. This script is for a fresh installation only."
     fi
 done
 
-if [[ -f /etc/pve/corosync.conf ]]; then
-    die "Existing cluster configuration detected. Refusing fresh installation."
-fi
+[[ ! -e /etc/pve/corosync.conf ]] || die "Existing cluster configuration found at /etc/pve/corosync.conf."
+[[ ! -e /var/lib/pve-cluster/config.db ]] || die "Existing PVE cluster database found. Refusing to overwrite it."
 
-if [[ -f /var/lib/pve-cluster/config.db ]]; then
-    die "Existing PVE cluster database detected. Refusing to overwrite it."
-fi
-
-# --------------------------------------------------
-# 3. Hostname configuration
-# --------------------------------------------------
-
-read -r -p "Enter Proxmox hostname [pve]: " HOSTNAME_INPUT
-HOSTNAME_INPUT="${HOSTNAME_INPUT:-pve}"
-
-[[ ${#HOSTNAME_INPUT} -le 253 ]] || die "Hostname is too long."
-
-if [[ ! "$HOSTNAME_INPUT" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$ ]]; then
-    die "Invalid hostname format."
-fi
-
-SHORT_HOSTNAME="${HOSTNAME_INPUT%%.*}"
-
-if [[ "$HOSTNAME_INPUT" == *.* ]]; then
-    FQDN="$HOSTNAME_INPUT"
-else
-    FQDN="${SHORT_HOSTNAME}.localdomain"
-fi
-
-info "Hostname: $SHORT_HOSTNAME"
-info "FQDN: $FQDN"
-
-# --------------------------------------------------
-# 4. Management IP detection
-# --------------------------------------------------
-
-IP_ADDRESS="$(ip -4 route get 1.1.1.1 2>/dev/null |
-    awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+# 3. Detect management IPv4 and validate it
+DEFAULT_ROUTE="$(ip -4 route get 1.1.1.1 2>/dev/null | head -n1 || true)"
+IP_ADDRESS="$(awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' <<<"$DEFAULT_ROUTE")"
 
 if [[ -z "$IP_ADDRESS" ]]; then
-    warn "Automatic management IP detection failed."
-    read -r -p "Enter your static management IPv4: " IP_ADDRESS
+    warn "Could not automatically detect the outbound management IPv4 address."
+    read -r -p "Enter an IPv4 address already configured on this host: " IP_ADDRESS
 fi
 
 python3 - "$IP_ADDRESS" <<'PY'
-import ipaddress
-import sys
-ipaddress.IPv4Address(sys.argv[1])
+import ipaddress, sys
+try:
+    ipaddress.IPv4Address(sys.argv[1])
+except Exception:
+    raise SystemExit("Invalid IPv4 address.")
 PY
 
-# Ensure selected IP actually belongs to this machine.
-if ! ip -o -4 addr show |
-    awk '{split($4,a,"/"); print a[1]}' |
-    grep -Fxq "$IP_ADDRESS"; then
-    die "Selected IP is not assigned to this machine."
+ip -o -4 addr show | awk '{split($4,a,"/"); print a[1]}' | grep -Fxq "$IP_ADDRESS" ||
+    die "The selected address ${IP_ADDRESS} is not assigned to this host."
+
+# 4. Hostname input and validation
+CURRENT_FQDN="$(hostname -f 2>/dev/null || true)"
+DEFAULT_FQDN="$CURRENT_FQDN"
+if [[ -z "$DEFAULT_FQDN" || "$DEFAULT_FQDN" == "localhost" || "$DEFAULT_FQDN" != *.* ]]; then
+    DEFAULT_FQDN="pve.home.arpa"
 fi
 
-info "Management IP: $IP_ADDRESS"
+read -r -p "Enter this node's FQDN [${DEFAULT_FQDN}]: " FQDN
+FQDN="${FQDN:-$DEFAULT_FQDN}"
+FQDN="${FQDN,,}"
+valid_fqdn "$FQDN" || die "Invalid FQDN. Example: pve.example.com or pve.home.arpa."
 
-read -r -p "Continue with this configuration? [y/N]: " CONFIRM
-[[ "$CONFIRM" =~ ^[Yy]$ ]] || die "Installation cancelled."
+SHORT_HOSTNAME="${FQDN%%.*}"
+[[ "$SHORT_HOSTNAME" != "localhost" ]] || die "The hostname cannot be localhost."
 
-# --------------------------------------------------
-# 5. Configuration backup
-# --------------------------------------------------
+# Check basic network/DNS reachability before changing system configuration.
+info "Checking access to official Proxmox repository..."
+getent ahosts enterprise.proxmox.com >/dev/null || die "DNS lookup failed for enterprise.proxmox.com."
+getent ahosts download.proxmox.com >/dev/null || die "DNS lookup failed for download.proxmox.com."
 
-BACKUP_DIR="/root/atyro-pve-backup-$(date +%Y%m%d-%H%M%S)"
+printf '\n'
+info "Installation configuration:"
+printf '  Debian       : %s (%s)\n' "$VERSION_ID" "$CODENAME"
+printf '  Proxmox VE   : %s\n' "$PVE_MAJOR"
+printf '  Hostname     : %s\n' "$SHORT_HOSTNAME"
+printf '  FQDN         : %s\n' "$FQDN"
+printf '  Management IP: %s\n' "$IP_ADDRESS"
+printf '\n'
+warn "Use a static management IP. This installer does not rewrite network interfaces or firewall rules."
+warn "A full Debian upgrade and Proxmox package installation will be performed."
+warn "Back up important data and ensure out-of-band/console access before continuing."
+ask_yes_no "Continue with Proxmox VE ${PVE_MAJOR} installation?" || die "Installation cancelled by user."
 
+# 5. Backup important configuration before editing
+BACKUP_DIR="/root/proxmox-installer-backup-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$BACKUP_DIR"
+for path in /etc/hosts /etc/hostname /etc/apt/sources.list /etc/apt/sources.list.d /etc/apt/preferences /etc/apt/preferences.d; do
+    if [[ -e "$path" ]]; then
+        cp -a "$path" "$BACKUP_DIR/"
+    fi
+done
+success "Configuration backup created: $BACKUP_DIR"
 
-cp -a /etc/hosts "$BACKUP_DIR/hosts"
-cp -a /etc/hostname "$BACKUP_DIR/hostname"
-
-[[ -f /etc/apt/sources.list ]] &&
-    cp -a /etc/apt/sources.list "$BACKUP_DIR/sources.list"
-
-[[ -d /etc/apt/sources.list.d ]] &&
-    cp -a /etc/apt/sources.list.d "$BACKUP_DIR/sources.list.d"
-
-success "Backup created: $BACKUP_DIR"
-
-# --------------------------------------------------
-# 6. Configure hostname and /etc/hosts
-# --------------------------------------------------
-
-hostnamectl set-hostname "$SHORT_HOSTNAME"
+# 6. Configure hostname and hosts mapping without changing network settings
+hostnamectl set-hostname "$FQDN"
 
 python3 - "$IP_ADDRESS" "$FQDN" "$SHORT_HOSTNAME" <<'PY'
+from pathlib import Path
 import sys
 
 ip, fqdn, short = sys.argv[1:]
-path = "/etc/hosts"
-
-with open(path) as f:
-    lines = f.readlines()
-
-result = []
+path = Path("/etc/hosts")
+lines = path.read_text().splitlines() if path.exists() else []
+out = []
+localhost4 = False
+localhost6 = False
 
 for line in lines:
     stripped = line.strip()
-
     if not stripped or stripped.startswith("#"):
-        result.append(line)
+        out.append(line)
         continue
 
     parts = stripped.split()
-    aliases = parts[1:]
+    if len(parts) < 2:
+        out.append(line)
+        continue
 
-    # Remove only exact hostname aliases.
-    aliases = [
-        name for name in aliases
-        if name not in (short, fqdn)
-    ]
+    addr, *names = parts
+    if addr == "127.0.0.1":
+        names = [n for n in names if n not in (fqdn, short)]
+        if "localhost" in names:
+            localhost4 = True
+        out.append("\t".join([addr] + names) if names else "127.0.0.1 localhost")
+    elif addr == "::1":
+        localhost6 = "localhost" in names
+        names = [n for n in names if n not in (fqdn, short)]
+        out.append("\t".join([addr] + names) if names else "::1 localhost")
+    else:
+        names = [n for n in names if n not in (fqdn, short)]
+        if names:
+            out.append("\t".join([addr] + names))
 
-    if aliases:
-        result.append(parts[0] + "\t" + " ".join(aliases) + "\n")
+if not localhost4:
+    out.insert(0, "127.0.0.1 localhost")
+if not localhost6:
+    out.append("::1 localhost")
 
-# Ensure localhost entry exists.
-if not any(
-    line.split()[:2] == ["127.0.0.1", "localhost"]
-    for line in result if line.strip() and not line.strip().startswith("#")
-):
-    result.insert(0, "127.0.0.1 localhost\n")
-
-result.append(f"{ip}\t{fqdn} {short}\n")
-
-with open(path, "w") as f:
-    f.writelines(result)
+# Ensure the node's FQDN resolves directly to its management address.
+out.append(f"{ip}\t{fqdn} {short}")
+path.write_text("\n".join(out) + "\n")
 PY
 
-hostname "$SHORT_HOSTNAME"
+hostname "$FQDN"
+getent hosts "$FQDN" | awk '{print $1}' | grep -Fxq "$IP_ADDRESS" ||
+    die "FQDN does not resolve to the selected management IP after /etc/hosts update."
+getent hosts "$SHORT_HOSTNAME" | awk '{print $1}' | grep -Fxq "$IP_ADDRESS" ||
+    die "Short hostname does not resolve to the selected management IP."
+success "Hostname and /etc/hosts verified."
 
-getent hosts "$SHORT_HOSTNAME" >/dev/null ||
-    die "Short hostname resolution failed."
-
-getent hosts "$FQDN" >/dev/null ||
-    die "FQDN resolution failed."
-
-success "Hostname and /etc/hosts configured."
-
-# --------------------------------------------------
-# 7. Disable conflicting Proxmox repositories
-# --------------------------------------------------
-
-info "Checking existing Proxmox repository configurations..."
-
+# 7. Disable only conflicting Proxmox repository entries; preserve unrelated sources.
+info "Checking for old/enterprise Proxmox repository entries..."
 python3 <<'PY'
 from pathlib import Path
 import re
 
-files = [Path("/etc/apt/sources.list")]
-files += list(Path("/etc/apt/sources.list.d").glob("*"))
+source_dirs = [Path("/etc/apt/sources.list.d")]
+legacy = Path("/etc/apt/sources.list")
+paths = ([legacy] if legacy.exists() else [])
+for d in source_dirs:
+    if d.exists():
+        paths.extend(p for p in d.iterdir() if p.is_file() and p.name != "atyro-proxmox.sources")
 
-pattern = re.compile(
-    r"enterprise\.proxmox\.com|"
-    r"download\.proxmox\.com/debian/(pve|ceph)",
-    re.I
-)
+pattern = re.compile(r"(enterprise\.proxmox\.com|download\.proxmox\.com/debian/pve)", re.I)
 
-for path in files:
-    if not path.is_file():
+for path in paths:
+    try:
+        text = path.read_text()
+    except (OSError, UnicodeDecodeError):
         continue
 
+    changed = False
     if path.suffix == ".sources":
-        content = path.read_text()
-        blocks = re.split(r"(\n\s*\n)", content)
-        changed = False
-
-        for i, block in enumerate(blocks):
-            if pattern.search(block):
-                lines = block.splitlines()
-                blocks[i] = "\n".join(
-                    "# Disabled by Atyro Installer: " + line
-                    if line.strip() and not line.lstrip().startswith("#")
-                    else line
-                    for line in lines
-                )
+        paragraphs = re.split(r"(\n\s*\n)", text)
+        for i in range(0, len(paragraphs), 2):
+            block = paragraphs[i]
+            if pattern.search(block) and not re.search(r"(?im)^\s*Enabled:\s*no\s*$", block):
+                if re.search(r"(?im)^\s*Enabled\s*:", block):
+                    block = re.sub(r"(?im)^\s*Enabled\s*:\s*.*$", "Enabled: no", block)
+                else:
+                    block = block.rstrip() + "\nEnabled: no\n"
+                paragraphs[i] = block
                 changed = True
-
-        if changed:
-            path.write_text("".join(blocks))
-            print(f"[DISABLED] {path}")
-
-    elif path.name.endswith(".list") or path.name == "sources.list":
-        lines = path.read_text().splitlines()
-        changed = False
-        output = []
-
-        for line in lines:
+        new_text = "".join(paragraphs)
+    else:
+        new_lines = []
+        for line in text.splitlines():
             if pattern.search(line) and not line.lstrip().startswith("#"):
-                output.append("# Disabled by Atyro Installer: " + line)
+                new_lines.append("# Disabled by Proxmox Installer: " + line)
                 changed = True
             else:
-                output.append(line)
+                new_lines.append(line)
+        new_text = "\n".join(new_lines) + ("\n" if text.endswith("\n") or new_lines else "")
 
-        if changed:
-            path.write_text("\n".join(output) + "\n")
-            print(f"[DISABLED] {path}")
+    if changed:
+        path.write_text(new_text)
+        print(f"[DISABLED CONFLICTING PVE SOURCE] {path}")
 PY
 
-# --------------------------------------------------
-# 8. Install required utilities
-# --------------------------------------------------
+# 8. Install download and signing utilities
+info "Installing prerequisite packages..."
+apt-get update
+apt-get install -y --no-install-recommends ca-certificates wget gnupg debian-archive-keyring
 
-if ! command -v wget >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y wget ca-certificates
-fi
+# 9. Fetch and validate the official Proxmox signing key
+info "Fetching official Proxmox signing key..."
+install -d -m 0755 /usr/share/keyrings
+TMP_KEY="$(mktemp)"
+trap 'rm -f "${TMP_KEY:-}"; on_error' ERR
+wget --https-only --timeout=30 --tries=3 -q "$KEY_URL" -O "$TMP_KEY"
+[[ -s "$TMP_KEY" ]] || die "Downloaded Proxmox key is empty."
+gpg --batch --show-keys "$TMP_KEY" >/dev/null 2>&1 || die "Downloaded Proxmox signing key is invalid."
+install -m 0644 "$TMP_KEY" "$KEYRING"
+rm -f "$TMP_KEY"
+trap on_error ERR
+success "Official Proxmox signing key installed."
 
-apt-get install -y ca-certificates gnupg
-
-# --------------------------------------------------
-# 9. Install official Proxmox archive key
-# --------------------------------------------------
-
-info "Downloading Proxmox signing key..."
-
-mkdir -p /usr/share/keyrings
-
-wget -q --show-progress "$KEY_URL" -O "${KEYRING}.tmp"
-
-[[ -s "${KEYRING}.tmp" ]] || die "Proxmox signing key download failed."
-
-# Validate key file before installing.
-gpg --show-keys "${KEYRING}.tmp" >/dev/null 2>&1 ||
-    die "Downloaded Proxmox key is invalid."
-
-install -m 0644 "${KEYRING}.tmp" "$KEYRING"
-rm -f "${KEYRING}.tmp"
-
-success "Proxmox signing key installed."
-
-# --------------------------------------------------
-# 10. Configure no-subscription repository
-# --------------------------------------------------
-
+# 10. Configure the matching no-subscription PVE repository
 cat > "$REPO_FILE" <<EOF
 Types: deb
 URIs: http://download.proxmox.com/debian/pve
@@ -332,171 +326,108 @@ Suites: ${CODENAME}
 Components: pve-no-subscription
 Signed-By: ${KEYRING}
 EOF
+chmod 0644 "$REPO_FILE"
+success "Proxmox VE ${PVE_MAJOR} repository configured for ${CODENAME}."
 
-success "Proxmox VE $PVE_VERSION repository configured."
-
-# --------------------------------------------------
-# 11. Update repositories
-# --------------------------------------------------
-
-info "Updating APT repositories..."
-
+# 11. Update APT and verify package availability
+info "Refreshing APT package indexes..."
 apt-get update
 
-# Confirm Proxmox packages are available.
-apt-cache policy proxmox-ve
-
-CANDIDATE="$(apt-cache policy proxmox-ve |
-    awk '/Candidate:/ {print $2; exit}')"
-
+CANDIDATE="$(apt-cache policy proxmox-ve | awk '/Candidate:/ {print $2; exit}')"
 [[ -n "$CANDIDATE" && "$CANDIDATE" != "(none)" ]] ||
-    die "Proxmox VE package is unavailable."
+    die "No proxmox-ve candidate found. Check APT output and repository connectivity."
+success "Proxmox VE package candidate: ${CANDIDATE}"
 
-success "Proxmox VE package candidate: $CANDIDATE"
-
-# --------------------------------------------------
-# 12. System upgrade
-# --------------------------------------------------
-
-warn "A full Debian package upgrade will be performed."
-
-read -r -p "Continue with full system upgrade? [y/N]: " UPGRADE_CONFIRM
-
-[[ "$UPGRADE_CONFIRM" =~ ^[Yy]$ ]] ||
-    die "Installation cancelled before system upgrade."
-
+# 12. Upgrade Debian before installing Proxmox
+warn "Running apt-get full-upgrade. This may update the kernel and core system packages."
 apt-get full-upgrade -y
 
-# --------------------------------------------------
-# 13. Install Proxmox VE
-# --------------------------------------------------
+# 13. Install Proxmox VE and required supporting services
+info "Preconfiguring Postfix to avoid interactive package prompts..."
+if command -v debconf-set-selections >/dev/null 2>&1; then
+    printf '%s\n' \
+        "postfix postfix/main_mailer_type select Local only" \
+        "postfix postfix/mailname string ${FQDN}" |
+        debconf-set-selections
+fi
 
-info "Installing Proxmox VE $PVE_VERSION..."
+info "Installing Proxmox VE ${PVE_MAJOR} and supporting packages..."
+apt-get install -y proxmox-ve postfix open-iscsi chrony curl
 
-apt-get install -y \
-    proxmox-ve \
-    postfix \
-    open-iscsi \
-    chrony
+# 14. Verify installed packages and refresh initramfs/boot entries
+for pkg in proxmox-ve pve-manager pve-cluster; do
+    dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed ||
+        die "Required package is not installed: ${pkg}"
+done
 
-success "Proxmox VE packages installed."
-
-# --------------------------------------------------
-# 14. Initramfs and boot configuration
-# --------------------------------------------------
-
-info "Updating initramfs..."
-
-update-initramfs -u -k all
-
+info "Refreshing initramfs..."
+if command -v update-initramfs >/dev/null 2>&1; then
+    update-initramfs -u -k all
+fi
+if command -v update-grub >/dev/null 2>&1; then
+    update-grub
+fi
 if command -v proxmox-boot-tool >/dev/null 2>&1; then
     proxmox-boot-tool refresh
 fi
 
-# --------------------------------------------------
-# 15. Enable essential services
-# --------------------------------------------------
-
-info "Enabling Proxmox services..."
-
-systemctl enable pve-cluster
-systemctl enable pvedaemon
-systemctl enable pvestatd
-systemctl enable pveproxy
-systemctl enable chrony
-
-# Start cluster filesystem first.
-info "Starting Proxmox cluster filesystem..."
+# 15. Start services in dependency order
+info "Enabling and starting Proxmox services..."
+systemctl enable pve-cluster pvedaemon pvestatd pveproxy chrony open-iscsi
 
 if ! systemctl restart pve-cluster; then
-    journalctl -u pve-cluster --no-pager -n 60
-    die "pve-cluster failed. See the service logs above."
+    journalctl -u pve-cluster --no-pager -n 80 || true
+    die "pve-cluster failed to start. See the service log above."
 fi
 
-# Start dependent services.
-for SERVICE in pvedaemon pvestatd pveproxy; do
-    info "Starting $SERVICE..."
-
-    if ! systemctl restart "$SERVICE"; then
-        journalctl -u "$SERVICE" --no-pager -n 40
-        die "$SERVICE failed to start."
+for service in pvedaemon pvestatd pveproxy; do
+    if ! systemctl restart "$service"; then
+        journalctl -u "$service" --no-pager -n 60 || true
+        die "${service} failed to start."
     fi
 done
 
 systemctl restart chrony
+systemctl start open-iscsi || warn "open-iscsi did not start; check whether your host requires iSCSI."
 
-# Firewall is checked separately.
-if systemctl list-unit-files pve-firewall.service --no-legend |
-    grep -q pve-firewall; then
+# 16. Final checks
+[[ "$(hostname -s)" == "$SHORT_HOSTNAME" ]] || die "Short hostname verification failed."
+getent hosts "$FQDN" | awk '{print $1}' | grep -Fxq "$IP_ADDRESS" || die "FQDN resolution check failed."
 
-    if ! systemctl start pve-firewall; then
-        warn "PVE firewall did not start. Check its logs."
-    fi
+for service in pve-cluster pvedaemon pvestatd pveproxy; do
+    systemctl is-active --quiet "$service" || {
+        systemctl status "$service" --no-pager -l || true
+        die "Required service is not active: ${service}"
+    }
+    success "${service} is active."
+done
+
+if ! curl -kfsS --connect-timeout 5 https://127.0.0.1:8006/api2/json/version >/dev/null; then
+    warn "The local HTTPS API check did not succeed yet. Check pveproxy logs and port 8006."
+else
+    success "Proxmox HTTPS API is responding on port 8006."
 fi
 
-# --------------------------------------------------
-# 16. Verify installed packages
-# --------------------------------------------------
+PVE_VERSION="$(pveversion 2>/dev/null | head -n1 || true)"
 
-for PKG in proxmox-ve pve-manager; do
-    dpkg-query -W -f='${Status}\n' "$PKG" 2>/dev/null |
-        grep -q "install ok installed" ||
-        die "Required package missing: $PKG"
-done
-
-# --------------------------------------------------
-# 17. Verify hostname and services
-# --------------------------------------------------
-
-[[ "$(hostname)" == "$SHORT_HOSTNAME" ]] ||
-    die "Hostname verification failed."
-
-getent hosts "$SHORT_HOSTNAME" >/dev/null ||
-    die "Short hostname resolution failed."
-
-getent hosts "$FQDN" >/dev/null ||
-    die "FQDN resolution failed."
-
-for SERVICE in pve-cluster pvedaemon pvestatd pveproxy; do
-    if ! systemctl is-active --quiet "$SERVICE"; then
-        systemctl status "$SERVICE" --no-pager -l || true
-        die "Required service is not active: $SERVICE"
-    fi
-
-    success "$SERVICE is active."
-done
-
-# --------------------------------------------------
-# 18. Final installation report
-# --------------------------------------------------
-
-echo
-echo "============================================"
-echo "       ATYRO PROXMOX INSTALLATION"
-echo "             COMPLETED"
-echo "============================================"
-echo
-echo "Debian       : $VERSION_ID ($CODENAME)"
-echo "Proxmox VE   : $PVE_VERSION"
-echo "Hostname     : $SHORT_HOSTNAME"
-echo "FQDN         : $FQDN"
-echo "IP Address   : $IP_ADDRESS"
-echo "Package      : $CANDIDATE"
-echo "Backup       : $BACKUP_DIR"
-echo "Log          : $LOG_FILE"
-echo
-echo "Web Interface:"
-echo "https://${IP_ADDRESS}:8006"
-echo
-echo "============================================"
-
-warn "A reboot is recommended to load the Proxmox kernel."
-
-read -r -p "Reboot now? [y/N]: " REBOOT
-
-if [[ "$REBOOT" =~ ^[Yy]$ ]]; then
-    info "Rebooting system..."
+printf '\n'
+printf '%s\n' '============================================================'
+printf '  %s installation finished\n' "$NAME"
+printf '%s\n' '============================================================'
+printf '  Author       : %s\n' "$AUTHOR"
+printf '  Installer    : %s\n' "$VERSION"
+printf '  Debian       : %s (%s)\n' "$VERSION_ID" "$CODENAME"
+printf '  Proxmox      : %s\n' "${PVE_VERSION:-installed}"
+printf '  Hostname     : %s\n' "$FQDN"
+printf '  Management IP: %s\n' "$IP_ADDRESS"
+printf '  Web UI       : https://%s:8006\n' "$IP_ADDRESS"
+printf '  Backup       : %s\n' "$BACKUP_DIR"
+printf '  Log          : %s\n' "$LOG_FILE"
+printf '%s\n' '============================================================'
+warn "A reboot is required/recommended to boot the installed Proxmox kernel."
+if ask_yes_no "Reboot this server now?"; then
+    info "Rebooting..."
     systemctl reboot
 else
-    warn "Reboot skipped. Reboot manually before using Proxmox."
+    warn "Reboot skipped. Schedule a maintenance reboot before creating VMs or containers."
 fi
