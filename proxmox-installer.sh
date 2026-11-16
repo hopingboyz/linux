@@ -260,7 +260,30 @@ PY
 # Keep the system hostname short, as expected by common Proxmox node setups.
 hostname "$SHORT_HOSTNAME"
 
-# Verify the literal hosts-file record first, then ask libc to resolve it.
+# Ensure /etc/hosts is checked before DNS/systemd-resolved.
+python3 <<'PY'
+from pathlib import Path
+import re
+path = Path("/etc/nsswitch.conf")
+if path.exists():
+    lines = path.read_text().splitlines()
+    output = []
+    found = False
+    for line in lines:
+        match = re.match(r"^(\\s*hosts\\s*:\\s*)(.*)$", line)
+        if match and not line.lstrip().startswith("#"):
+            tokens = [x for x in match.group(2).split() if x != "files"]
+            tokens.insert(0, "files")
+            output.append(match.group(1) + " ".join(tokens))
+            found = True
+        else:
+            output.append(line)
+    if not found:
+        output.append("hosts: files dns")
+    path.write_text("\\n".join(output) + "\\n")
+PY
+
+# Verify the literal hosts-file record and resolve IPv4 specifically.
 # This avoids depending on getent's optional -s service-selection syntax.
 python3 - "$IP_ADDRESS" "$FQDN" "$SHORT_HOSTNAME" <<'PY'
 from pathlib import Path
@@ -289,16 +312,18 @@ if not matches:
     )
 PY
 
-HOSTS_LOOKUP="$(getent hosts "$FQDN" 2>/dev/null || true)"
+HOSTS_LOOKUP="$(getent ahostsv4 "$FQDN" 2>/dev/null || true)"
 if ! awk -v ip="$IP_ADDRESS" '$1 == ip { found=1 } END { exit !found }' <<<"$HOSTS_LOOKUP"; then
-    warn "The hosts-file entry is correct, but NSS resolution did not return ${IP_ADDRESS}."
-    warn "Check /etc/nsswitch.conf (hosts: files should appear before dns) and any local name-service overrides."
-    die "Hostname resolution verification failed."
+    error "FQDN IPv4 resolution failed. Expected ${IP_ADDRESS} ${FQDN}."
+    grep -F "$FQDN" /etc/hosts || true
+    die "FQDN resolution verification failed."
 fi
 
-SHORT_LOOKUP="$(getent hosts "$SHORT_HOSTNAME" 2>/dev/null || true)"
+SHORT_LOOKUP="$(getent ahostsv4 "$SHORT_HOSTNAME" 2>/dev/null || true)"
 if ! awk -v ip="$IP_ADDRESS" '$1 == ip { found=1 } END { exit !found }' <<<"$SHORT_LOOKUP"; then
-    die "Short hostname does not resolve to ${IP_ADDRESS}."
+    error "Short hostname IPv4 resolution failed. Expected ${IP_ADDRESS} ${SHORT_HOSTNAME}."
+    grep -F "$SHORT_HOSTNAME" /etc/hosts || true
+    die "Short hostname resolution verification failed."
 fi
 
 [[ "$(hostname -s)" == "$SHORT_HOSTNAME" ]] || die "System short hostname did not apply correctly."
@@ -444,7 +469,7 @@ systemctl start open-iscsi || warn "open-iscsi did not start; check whether your
 
 # 16. Final checks
 [[ "$(hostname -s)" == "$SHORT_HOSTNAME" ]] || die "Short hostname verification failed."
-getent hosts "$FQDN" | awk '{print $1}' | grep -Fxq "$IP_ADDRESS" || die "FQDN resolution check failed."
+getent ahostsv4 "$FQDN" | awk -v ip="$IP_ADDRESS" '$1 == ip { found=1 } END { exit !found }' || die "FQDN IPv4 resolution check failed."
 
 for service in pve-cluster pvedaemon pvestatd pveproxy; do
     systemctl is-active --quiet "$service" || {
